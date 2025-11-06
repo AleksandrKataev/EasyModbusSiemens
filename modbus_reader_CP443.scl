@@ -1,0 +1,214 @@
+FUNCTION_BLOCK "MODBUS_TCP_Reader"
+
+TITLE = 'MB TCP Reader CP443'
+VERSION: '0.0'
+AUTHOR: 'KataevAA'
+NAME: 'MB TCP'
+FAMILY: 'MB'
+
+CONST
+    MAX_NUM_OF_REGS := 10;
+END_CONST
+
+VAR_INPUT
+  Timeout { S7_visible := 'true' }: TIME  := T#3S;    //Время установления ошибки связи
+  CP_LADDR_0 : WORD;    // Базовый адрес CP443 основной модуль
+  ID_0 : INT;        // ID основного соединения
+  CP_LADDR_1 : WORD;    // Базовый адрес CP443 резервированный модуль
+  ID_1 : INT;        // ID резервированного соединения
+  MDBS_ADDR : INT;    // Адрес ведомого устройства
+  MDBS_FUNC : INT;    // Код функции
+  MDBS_NUM_OFFSET : INT;    // Число смещения
+  MDBS_NUM_REG : INT;    // Количество слов (1-125)
+END_VAR
+VAR_OUTPUT
+  outSendError : BOOL;    //Ошибка отправки данных в CP
+  outSendStatus: WORD;    //Статус ошибки отправления данных
+  outRcvLen : INT;    //Длина полученных данных, байт
+  outRcvError : BOOL;    //Ошибка получения данных из CP
+  outRcvStatus : WORD;    //Статус ошибки получения данных
+  NOCONNECT : BOOL;    //Бит отсутствия связи (1 - связи нет, 0 - связь есть)
+  outREG1 : WORD;
+  outREG2 : WORD;
+  outREG3 : WORD;
+  outREG4 : WORD;
+  outREG5 : WORD;
+  outREG6 : WORD;
+  outREG7 : WORD;
+  outREG8 : WORD;
+  outREG9 : WORD;
+  outREG10 : WORD;  // MAX_NUM_OF_REGS
+END_VAR
+VAR
+  STRUCT_SEND : STRUCT
+   Ident_Tranz : WORD;
+   Ident_Protocol : WORD := 0;
+   LEN_FIELD : WORD;
+   DeviceId : BYTE;
+   MDB_CODE : BYTE;
+   MDB_REG : WORD;
+   NUM_REG : WORD;
+  END_STRUCT;
+  // Длина = 2 ID_tranz + 2 ID_prot + 2 len + 1 devId + 1 func + 1 NumOfByteData + MAX_NUM_OF_REGS*2
+  RecPack : ARRAY [1..(9+MAX_NUM_OF_REGS*2)] OF BYTE;
+  TimeoutTimer : "TON";
+  COUNTER_SND_OK : DINT;    // Счетчик отправленных посылок без ошибок
+  COUNTER_SND_ERR : DINT := -1;   // Счетчик отправленных посылок с ошибок
+  COUNTER_RCV_OK : DINT;    // Счетчик полученных посылок без ошибок
+  COUNTER_RCV_ERR : DINT;   // Счетчик полученных посылок с ошибок
+  Laddr : WORD;    // Реально используемый LADDR
+  ID : INT;        // Реально используемый ID
+  Sending : bool;
+END_VAR
+VAR_IN_OUT
+    ioIdent : INT;  // Идентификатор запроса
+    ioBusy : BOOL;  // Для последовательного соединения блоков. По значению 0 отправляется запрос.
+END_VAR
+VAR_TEMP
+  tmpDone : BOOL;
+  tmpAny : ANY;
+  tmpAny_AT AT tmpAny : STRUCT
+    BYTE0 :BYTE;  // Byte 0
+    TYP   :BYTE;  // Byte 1       Data/Type of parameter
+    LEN   :WORD;  // Byte 2+3     Length of the variables
+    DBNR  :WORD;  // Byte 4+5     DB-Number
+    BZ    :DWORD; // Byte 6 to 10 Area pointers
+  END_STRUCT;
+  tmpDstAny : ANY;
+  tmpDstAny_AT AT tmpDstAny : STRUCT
+    BYTE0 :BYTE;  // Byte 0
+    TYP   :BYTE;  // Byte 1       Data/Type of parameter
+    LEN   :WORD;  // Byte 2+3     Length of the variables
+    DBNR  :WORD;  // Byte 4+5     DB-Number
+    BZ    :DWORD; // Byte 6 to 10 Area pointers
+  END_STRUCT;
+  tmpError : BOOL;
+  tmpInt :INT; // Заглушка BLKMOV
+END_VAR
+LABEL
+    ERR;
+END_LABEL
+
+// Если запрос отправлен но не нами, выходим
+IF ioBusy AND NOT TimeoutTimer.IN  THEN
+    RETURN;
+END_IF;
+
+// Проверки входов
+IF MDBS_NUM_REG > MAX_NUM_OF_REGS
+    OR ((ID_0 = 0 OR CP_LADDR_0 = 0) AND (ID_1 = 0 OR CP_LADDR_0 = 0))
+THEN
+    outSendStatus := 16#FFFF;
+    RETURN;
+END_IF;
+
+// Таймер обрабатывается в начале иначе мы его не сбросим никогда
+TimeoutTimer(PT:= Timeout);
+
+IF NOT ioBusy THEN
+    ioBusy := TRUE;
+    TimeoutTimer.IN := TRUE;
+    ioIdent := ioIdent + 1;
+    // Заполняем запрос
+    STRUCT_SEND.Ident_Tranz := INT_TO_WORD(ioIdent);
+    STRUCT_SEND.Ident_Protocol := 0;
+    STRUCT_SEND.LEN_FIELD := 6;
+    STRUCT_SEND.DeviceId := INT_TO_BYTE(MDBS_ADDR);
+    STRUCT_SEND.MDB_CODE := INT_TO_BYTE(MDBS_FUNC);
+    STRUCT_SEND.MDB_REG := INT_TO_WORD(MDBS_NUM_OFFSET);
+    STRUCT_SEND.NUM_REG := INT_TO_WORD(MDBS_NUM_REG);
+  
+    Sending := true;
+END_IF;
+
+IF Sending THEN  
+    // Отправляем запрос
+    "AG_LSEND"(ACT    := TRUE,
+               ID     := ID,
+               LADDR  := Laddr,
+               SEND   := STRUCT_SEND,
+               LEN    := 12,
+               DONE   := tmpDone,
+               ERROR  := outSendError,
+               STATUS := outSendStatus);
+    
+    // Если не удалось отправить, то и ждать не зачем
+    IF outSendError THEN
+        COUNTER_SND_ERR := COUNTER_SND_ERR + 1;
+        GOTO ERR ;
+    END_IF;
+    
+    IF tmpDone THEN
+        COUNTER_SND_OK := COUNTER_SND_OK + 1;
+        Sending := false;
+    ELSE 
+        RETURN;
+    END_IF;
+END_IF;
+
+// Ждем ответ
+tmpAny := RecPack;
+IF MDBS_FUNC < 3 THEN
+    tmpAny_AT.LEN := INT_TO_WORD(9 + (MDBS_NUM_REG+7)/8 );
+ELSE
+    tmpAny_AT.LEN := INT_TO_WORD(9 + MDBS_NUM_REG*2);
+END_IF;
+"AG_LRECV" (ID     := ID,
+            LADDR  := Laddr,
+            RECV   := tmpAny,
+            NDR    := tmpDone,
+            ERROR  := outRcvError,
+            STATUS := outRcvStatus,
+            LEN    := outRcvLen);
+
+// Разбираем ответ если пришел
+IF tmpDone THEN
+    COUNTER_RCV_OK := COUNTER_RCV_OK + 1;
+    NOCONNECT := FALSE;
+    ioBusy := FALSE;
+    TimeoutTimer.IN := FALSE;
+    
+    // Проверяем что пакет корректный
+    IF RecPack[3]<> 0 OR RecPack[4] <> 0 
+        OR RecPack[7] <> INT_TO_BYTE(MDBS_ADDR)
+        OR RecPack[8] <> INT_TO_BYTE(MDBS_FUNC)
+        OR outRcvLen <> (BYTE_TO_INT(RecPack[5])*256+BYTE_TO_INT(RecPack[6])+6)
+    THEN
+        COUNTER_RCV_ERR := COUNTER_RCV_ERR + 1;
+        outRcvError := true;
+        outRcvStatus := 16#FFFE;
+        RETURN;
+    END_IF;
+    
+    tmpDstAny := outREG1;
+    tmpDstAny_AT.LEN := MAX_NUM_OF_REGS;
+    tmpAny := RecPack[10];
+    tmpAny_AT.LEN := RecPack[9];
+    tmpInt := BLKMOV(SRCBLK := tmpAny, DSTBLK := tmpDstAny);
+END_IF;
+
+IF outRcvError OR TimeoutTimer.Q THEN
+    COUNTER_RCV_ERR := COUNTER_RCV_ERR + 1;
+    GOTO ERR;
+END_IF;
+
+RETURN;
+// В случае ошибки
+ERR: 
+    TimeoutTimer.IN := FALSE;
+    ioBusy := FALSE;
+    NOCONNECT := TRUE;
+    Sending := false;
+    // Переключаемся на другой канал
+    IF ID = ID_0 AND Laddr = CP_LADDR_0 AND ID_1 <> 0 AND CP_LADDR_1 <> 0 THEN
+        ID := ID_1;
+        Laddr := CP_LADDR_1;
+    ELSE
+        ID := ID_0;
+        Laddr := CP_LADDR_0;
+    END_IF;
+END_FUNCTION_BLOCK
+
+DATA_BLOCK DB1  FB1
+BEGIN
+END_DATA_BLOCK
